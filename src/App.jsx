@@ -1,4 +1,61 @@
-import { useState, useReducer, useCallback } from "react";
+import { useState, useReducer, useRef } from "react";
+
+// ============================================================
+// 🔊  SOUND + MEME ENGINE
+// ============================================================
+
+// Meme reactions based on how bad the spending is
+const MEME_MESSAGES = {
+  // Spent nothing today
+  none: [
+    "今日は天才か？👏",
+    "節約マスター現る🧘",
+    "お財布が喜んでる💚",
+  ],
+  // Under budget — good job
+  good: [
+    "頑張れ頑張れ！💪",
+    "その調子や！🔥",
+    "えらい！偉すぎる！👑",
+    "神ってる〜！✨",
+    "お前天才じゃん😤",
+  ],
+  // A little over
+  warning: [
+    "ちょっと使いすぎちゃった…😅",
+    "まあ、人間だもんね🙃",
+    "次は気をつけて！⚠️",
+    "あぶな〜い！😬",
+  ],
+  // Way over budget
+  danger: [
+    "ふざけんなお前💀",
+    "は？何してんの？😡",
+    "財布を今すぐ閉めろ🚨",
+    "もうダメだ終わった🫠",
+    "お金どこ行った？！🤯",
+    "やばすぎて笑えない😭",
+  ],
+};
+
+const getMemeMessage = (todaySpent, safeDaily) => {
+  if (todaySpent === 0) return rand(MEME_MESSAGES.none);
+  const ratio = safeDaily > 0 ? todaySpent / safeDaily : 0;
+  if (ratio <= 0.7) return rand(MEME_MESSAGES.good);
+  if (ratio <= 1.0) return rand(MEME_MESSAGES.warning);
+  return rand(MEME_MESSAGES.danger);
+};
+
+const rand = (arr) => arr[Math.floor(Math.random() * arr.length)];
+
+// Play the faaah sound
+const playFaaah = () => {
+  try {
+    const audio = new Audio(process.env.PUBLIC_URL + "/faaah.mp3");
+    audio.volume = 0.7;
+    audio.play().catch(() => {}); // ignore autoplay block
+  } catch {}
+};
 
 // ============================================================
 // 🗄️  DATA LAYER
@@ -48,47 +105,48 @@ const calcBudget = (profile, expenses) => {
   const income = Number(profile.currentIncome) || 0;
   const freeMoney = income - totalFixed;
 
-  // Period start: day after last payday (or first of month if not set)
-  let periodStart;
+  // Period start = lastPayday itself (the day you received money)
+  // NOT the day after — otherwise expenses logged on payday get excluded
+  let periodStartStr;
   if (profile.lastPayday) {
-    periodStart = new Date(profile.lastPayday + "T00:00:00");
-    periodStart.setDate(periodStart.getDate() + 1); // day AFTER payday
+    periodStartStr = profile.lastPayday; // YYYY-MM-DD, inclusive
   } else {
     const now = new Date();
-    periodStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    periodStartStr = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-01`;
   }
 
-  // Filter expenses in current pay period
-  const periodExpenses = expenses.filter((e) => {
-    const expDate = new Date(e.date.split("T")[0] + "T00:00:00");
-    return expDate >= periodStart;
-  });
+  const todayStr = getTodayStr();
 
+  // All expense dates are stored as plain YYYY-MM-DD — compare as strings directly
+  const getDateStr = (e) => e.date.length === 10 ? e.date : e.date.substring(0, 10);
+
+  const periodExpenses = expenses.filter((e) => getDateStr(e) >= periodStartStr);
   const totalSpent = periodExpenses.reduce((s, e) => s + Number(e.amount), 0);
   const remaining = freeMoney - totalSpent;
 
-  // Days until next payday (at least 1 to avoid division by zero)
   const daysUntilPay = profile.nextPayday
     ? Math.max(getDaysUntil(profile.nextPayday), 1)
     : 30;
 
   const safeDaily = remaining > 0 ? Math.floor(remaining / daysUntilPay) : 0;
 
-  // Today's spending — compare local date strings directly
-  const todayStr = getTodayStr();
+  // Today's spending — plain string equality
   const todaySpent = periodExpenses
-    .filter((e) => e.date.startsWith(todayStr))
+    .filter((e) => getDateStr(e) === todayStr)
     .reduce((s, e) => s + Number(e.amount), 0);
 
-  // Positive = saved money today, negative = over budget today
   const todayDiff = safeDaily - todaySpent;
 
+  // Today's breakdown by category
+  const todayCats = {};
+  periodExpenses
+    .filter((e) => getDateStr(e) === todayStr)
+    .forEach((e) => { todayCats[e.category] = (todayCats[e.category] || 0) + Number(e.amount); });
+
   // 7-day rolling average
-  const weekAgo = new Date();
-  weekAgo.setDate(weekAgo.getDate() - 7);
-  const weekAgoStr = toLocalDateStr(weekAgo);
+  const weekAgoStr = toLocalDateStr(new Date(Date.now() - 7 * 86400000));
   const recentSpend = expenses
-    .filter((e) => e.date.split("T")[0] >= weekAgoStr)
+    .filter((e) => getDateStr(e) >= weekAgoStr)
     .reduce((s, e) => s + Number(e.amount), 0);
   const dailyAvg = Math.floor(recentSpend / 7);
 
@@ -100,7 +158,7 @@ const calcBudget = (profile, expenses) => {
     totalFixed, freeMoney, totalSpent, remaining,
     daysUntilPay, safeDaily, dailyAvg,
     overspending, runOutDays,
-    periodExpenses, todaySpent, todayDiff,
+    periodExpenses, todaySpent, todayDiff, todayCats,
   };
 };
 
@@ -117,26 +175,20 @@ const getWeeklySummary = (expenses) => {
 // Streak = consecutive days at or under safeDaily, within pay period
 const calcStreak = (expenses, safeDaily, lastPayday) => {
   if (safeDaily <= 0) return 0;
-
-  // Build per-day totals
+  const getDateStr = (e) => e.date.length === 10 ? e.date : e.date.substring(0, 10);
   const byDay = {};
   expenses.forEach((e) => {
-    const d = e.date.split("T")[0];
+    const d = getDateStr(e);
     byDay[d] = (byDay[d] || 0) + Number(e.amount);
   });
-
-  // Period start
   const periodStartStr = lastPayday
-    ? toLocalDateStr(new Date(new Date(lastPayday + "T00:00:00").getTime() + 86400000))
-    : toLocalDateStr(new Date(new Date().getFullYear(), new Date().getMonth(), 1));
-
+    ? lastPayday
+    : (() => { const n = new Date(); return `${n.getFullYear()}-${String(n.getMonth()+1).padStart(2,'0')}-01`; })();
   let streak = 0;
   for (let i = 0; i < 60; i++) {
-    const d = new Date(Date.now() - i * 86400000);
-    const key = toLocalDateStr(d);
-    if (key < periodStartStr) break; // don't go before period start
-    const spent = byDay[key] || 0;
-    if (spent <= safeDaily) streak++;
+    const key = toLocalDateStr(new Date(Date.now() - i * 86400000));
+    if (key < periodStartStr) break;
+    if ((byDay[key] || 0) <= safeDaily) streak++;
     else break;
   }
   return streak;
@@ -199,10 +251,11 @@ function reducer(state, action) {
       const { profile, expenses } = state;
       let historyEntry = null;
       if (profile.lastPayday && profile.nextPayday) {
-        const periodStart = new Date(profile.lastPayday + "T00:00:00");
-        periodStart.setDate(periodStart.getDate() + 1);
-        const periodStartStr = toLocalDateStr(periodStart);
-        const periodExp = expenses.filter((e) => e.date.split("T")[0] >= periodStartStr);
+        const periodStartStr = profile.lastPayday; // inclusive from payday itself
+        const periodExp = expenses.filter((e) => {
+          const d = e.date.length === 10 ? e.date : e.date.substring(0, 10);
+          return d >= periodStartStr;
+        });
         const spent = periodExp.reduce((s, e) => s + Number(e.amount), 0);
         const inc = Number(profile.currentIncome) || 0;
         const fixed = profile.fixedExpenses.reduce((s, e) => s + Number(e.amount), 0);
@@ -368,7 +421,6 @@ function HomeTab({ state, dispatch }) {
   const budget = calcBudget(profile, expenses);
   const streak = calcStreak(expenses, budget.safeDaily, profile.lastPayday);
   const daysUntilPay = profile.nextPayday ? getDaysUntil(profile.nextPayday) : null;
-  const weekly = getWeeklySummary(expenses);
   const spentPct = budget.freeMoney > 0 ? (budget.totalSpent / budget.freeMoney) * 100 : 0;
 
   const safeColor = budget.remaining <= 0 ? "#f43f5e"
@@ -492,26 +544,44 @@ function HomeTab({ state, dispatch }) {
         </Card>
       )}
 
-      {/* ── WEEKLY SUMMARY ── */}
+      {/* ── TODAY SUMMARY ── */}
       <Card className="p-4">
-        <p className="font-bold text-stone-800 text-sm mb-3">📊 今週のまとめ</p>
-        <div className="flex justify-between items-center">
-          <div>
-            <p className="text-stone-400 text-xs">合計支出</p>
-            <p className="font-bold text-stone-800 text-xl">{fmt(weekly.total)}</p>
-          </div>
-          {weekly.topCategory && (
-            <div className="text-center">
-              <p className="text-stone-400 text-xs">最多カテゴリ</p>
-              <p className="font-bold text-stone-700 text-sm">
-                {CAT_MAP[weekly.topCategory]?.emoji} {CAT_MAP[weekly.topCategory]?.label}
-              </p>
-            </div>
-          )}
-          <Badge color={weekly.total <= budget.safeDaily * 7 ? "green" : "amber"}>
-            {weekly.total <= budget.safeDaily * 7 ? "順調👍" : "注意⚠️"}
+        <div className="flex items-center justify-between mb-3">
+          <p className="font-bold text-stone-800 text-sm">今日のまとめ</p>
+          <Badge color={budget.todaySpent === 0 ? "stone" : budget.todayDiff >= 0 ? "green" : "red"}>
+            {budget.todaySpent === 0 ? "支出なし" : budget.todayDiff >= 0 ? `${fmt(budget.todayDiff)} 節約` : `${fmt(Math.abs(budget.todayDiff))} オーバー`}
           </Badge>
         </div>
+
+        {/* Today progress bar */}
+        <div className="mb-3">
+          <ProgressBar
+            pct={budget.safeDaily > 0 ? (budget.todaySpent / budget.safeDaily) * 100 : 0}
+            color={budget.todayDiff < 0 ? "#f43f5e" : "#10b981"}
+          />
+          <div className="flex justify-between text-xs text-stone-400 mt-1.5">
+            <span>使用 {fmt(budget.todaySpent)}</span>
+            <span>目標 {fmt(budget.safeDaily)}</span>
+          </div>
+        </div>
+
+        {/* Category breakdown for today */}
+        {Object.keys(budget.todayCats).length > 0 ? (
+          <div className="space-y-1.5 pt-2 border-t border-stone-50">
+            {Object.entries(budget.todayCats)
+              .sort((a, b) => b[1] - a[1])
+              .map(([catId, amount]) => (
+                <div key={catId} className="flex items-center justify-between">
+                  <span className="text-sm text-stone-600">
+                    {CAT_MAP[catId]?.emoji} {CAT_MAP[catId]?.label}
+                  </span>
+                  <span className="font-bold text-stone-800 text-sm">{fmt(amount)}</span>
+                </div>
+              ))}
+          </div>
+        ) : (
+          <p className="text-center text-stone-400 text-xs pt-1">今日はまだ何も記録していません ☀️</p>
+        )}
       </Card>
 
       {/* ── GOALS ── */}
@@ -538,9 +608,34 @@ function HomeTab({ state, dispatch }) {
 }
 
 // ============================================================
+// 🍞  MEME TOAST
+// ============================================================
+function MemeToast({ message, onDone }) {
+  return (
+    <div
+      className="fixed top-6 left-1/2 z-[100] animate-bounce-in"
+      style={{
+        transform: "translateX(-50%)",
+        animation: "toastIn 0.3s cubic-bezier(0.34,1.56,0.64,1) forwards",
+      }}
+    >
+      <div className="bg-stone-900 text-white font-black text-base px-5 py-3 rounded-2xl shadow-2xl whitespace-nowrap">
+        {message}
+      </div>
+      <style>{`
+        @keyframes toastIn {
+          from { opacity: 0; transform: translateX(-50%) scale(0.7) translateY(-10px); }
+          to   { opacity: 1; transform: translateX(-50%) scale(1)   translateY(0); }
+        }
+      `}</style>
+    </div>
+  );
+}
+
+// ============================================================
 // ➕  ADD EXPENSE MODAL
 // ============================================================
-function AddExpenseModal({ dispatch }) {
+function AddExpenseModal({ dispatch, onAdded }) {
   const [amount, setAmount] = useState("");
   const [category, setCategory] = useState("food");
   const [note, setNote] = useState("");
@@ -548,13 +643,11 @@ function AddExpenseModal({ dispatch }) {
   const handleSubmit = () => {
     const n = parseInt(amount, 10);
     if (!n || n <= 0) return;
-    // Store with local date so today-comparison works correctly
-    const now = new Date();
-    const localISO = `${toLocalDateStr(now)}T${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}:00`;
     dispatch({
       type: "ADD_EXPENSE",
-      expense: { id: Date.now().toString(), amount: n, category, note: note.trim(), date: localISO },
+      expense: { id: Date.now().toString(), amount: n, category, note: note.trim(), date: getTodayStr() },
     });
+    onAdded(n); // trigger sound + meme
   };
 
   return (
@@ -1061,14 +1154,32 @@ const TAB_TITLES = { home: "学生バジェット", history: "支出履歴", ins
 export default function App() {
   const [state, dispatch] = useReducer(reducer, initialState);
   const { profile } = state;
+  const [toast, setToast] = useState(null);
+  const toastTimer = useRef(null);
 
   const needsSetup = !profile.currentIncome || !profile.nextPayday || isPaydayPast(profile.nextPayday);
   const canDismiss = !needsSetup && state.modal === "newPeriod";
   const showPeriodModal = (needsSetup || state.modal === "newPeriod") && state.modal !== "add";
 
+  // Called right after an expense is added
+  const handleExpenseAdded = (amount) => {
+    playFaaah();
+    // Recalculate budget with the new expense already in state would be ideal,
+    // but we can estimate: use current todaySpent + new amount for meme pick
+    const budget = calcBudget(profile, state.expenses);
+    const newTodaySpent = budget.todaySpent + amount;
+    const msg = getMemeMessage(newTodaySpent, budget.safeDaily);
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    setToast(msg);
+    toastTimer.current = setTimeout(() => setToast(null), 2800);
+  };
+
   return (
     <div className="min-h-screen"
       style={{ fontFamily: "'Helvetica Neue', 'Hiragino Sans', 'Noto Sans JP', sans-serif", background: "#fafaf9" }}>
+
+      {/* Meme toast */}
+      {toast && <MemeToast message={toast} onDone={() => setToast(null)} />}
 
       <header className="sticky top-0 z-30 bg-white/80 backdrop-blur-md border-b border-stone-100">
         <div className="max-w-md mx-auto px-4 flex items-center justify-between"
@@ -1092,7 +1203,7 @@ export default function App() {
       <BottomNav activeTab={state.activeTab} dispatch={dispatch} />
 
       {showPeriodModal && <NewPayPeriodModal profile={profile} dispatch={dispatch} canDismiss={canDismiss} />}
-      {state.modal === "add" && <AddExpenseModal dispatch={dispatch} />}
+      {state.modal === "add" && <AddExpenseModal dispatch={dispatch} onAdded={handleExpenseAdded} />}
     </div>
   );
 }
